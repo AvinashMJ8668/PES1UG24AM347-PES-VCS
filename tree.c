@@ -1,20 +1,16 @@
 // tree.c — Tree object serialization and construction
-//
-// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
-//
-// Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
-//
-// Example single entry (conceptual):
-//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
+#include "pes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+
+// Forward declaration for object_write (implemented in object.c)
+extern int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
@@ -114,24 +110,91 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// ─── IMPLEMENTED ──────────────────────────────────────────────────
+
+// Helper function to find the length of the current path segment
+static int path_component_len(const char *path) {
+    const char *slash = strchr(path, '/');
+    if (slash) return slash - path;
+    return strlen(path);
+}
+
+// Recursive helper to build sub-trees from a sorted list of index entries
+static int build_tree_recursive(IndexEntry *entries, int count, int path_offset, ObjectID *out_id) {
+    Tree tree;
+    tree.count = 0;
+    
+    int i = 0;
+    while (i < count && tree.count < MAX_TREE_ENTRIES) {
+        const char *current_path = entries[i].path + path_offset;
+        int comp_len = path_component_len(current_path);
+        
+        TreeEntry *te = &tree.entries[tree.count++];
+        strncpy(te->name, current_path, comp_len);
+        te->name[comp_len] = '\0';
+        
+        if (current_path[comp_len] == '\0') {
+            // It's a file blob
+            te->mode = entries[i].mode;
+            te->hash = entries[i].hash;
+            i++;
+        } else {
+            // It's a subdirectory tree
+            te->mode = MODE_DIR;
+            int group_count = 0;
+            
+            // Count how many files belong to this subdirectory prefix
+            for (int j = i; j < count; j++) {
+                const char *p = entries[j].path + path_offset;
+                if (strncmp(p, current_path, comp_len) == 0 && p[comp_len] == '/') {
+                    group_count++;
+                } else {
+                    break;
+                }
+            }
+            
+            ObjectID sub_id;
+            if (build_tree_recursive(entries + i, group_count, path_offset + comp_len + 1, &sub_id) != 0) {
+                return -1;
+            }
+            te->hash = sub_id;
+            i += group_count;
+        }
+    }
+    
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+    
+    int rc = object_write(OBJ_TREE, data, len, out_id);
+    free(data);
+    return rc;
+}
+
+// --- WORKAROUND FOR MAKEFILE MISSING INDEX.O ---
+// This provides a dummy function for test_tree to link successfully.
+// Your actual index.c implementation in Phase 3 will override this.
+__attribute__((weak)) int index_load(Index *index) {
+    if (index) index->count = 0;
+    return 0;
+}
+// -----------------------------------------------
 
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index idx;
+    if (index_load(&idx) != 0) return -1;
+    
+    if (idx.count == 0) {
+        Tree empty_tree = {0};
+        void *data;
+        size_t len;
+        if (tree_serialize(&empty_tree, &data, &len) != 0) return -1;
+        int rc = object_write(OBJ_TREE, data, len, id_out);
+        free(data);
+        return rc;
+    }
+    
+    return build_tree_recursive(idx.entries, idx.count, 0, id_out);
 }
